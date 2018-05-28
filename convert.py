@@ -1,3 +1,8 @@
+import argparse
+import os
+import shutil
+import tarfile
+
 import chainer
 import numpy as np
 import tensorflow as tf
@@ -5,24 +10,36 @@ import tensorflow as tf
 import mobilenet_v1_ch
 import mobilenet_v1_tf
 
+### ARGPARSE ###
+parser = argparse.ArgumentParser(description='Convert Tensorflow MobilenetV1 \
+                                              models to Chainer')
+parser.add_argument('tgz', help='.tgz file containing the target model')
+
+args = parser.parse_args()
+
+tar = tarfile.open(args.tgz, "r:gz")
+model_name = os.path.basename(args.tgz)[:-4]
+tar.extractall(model_name)
+
+ckpt_file = os.path.join(model_name, model_name + '.ckpt')
+depth_multiplier = float(model_name.split('_')[2])
+
 ### TENSORFLOW GRAPH ###
 x = tf.placeholder(tf.float32, shape=(None, 224, 224, 3))
 model_tf, _ = mobilenet_v1_tf.mobilenet_v1(x, num_classes=1001,
+                                           depth_multiplier=depth_multiplier,
                                            is_training=False)
 saver = tf.train.Saver()
 
 ### CHAINER GRAPH ###
-model_ch = mobilenet_v1_ch.MobilenetV1()
+model_ch = mobilenet_v1_ch.MobilenetV1(depth_multiplier=depth_multiplier)
 
 ### COPY ROUTINE ###
 with tf.Session() as sess:
-    saver.restore(sess, 'mobilenet_v1_1.0_224/mobilenet_v1_1.0_224.ckpt')
-
-    writer = tf.summary.FileWriter('logs', sess.graph)
-    writer.close()
+    saver.restore(sess, ckpt_file)
 
     for var in tf.global_variables():
-        if 'MobileNetV1' not in var.name \
+        if 'MobilenetV1' not in var.name \
           or 'RMSProp' in var.name \
           or 'ExponentialMovingAverage' in var.name:
             continue
@@ -38,59 +55,60 @@ with tf.Session() as sess:
 
         vals = sess.run(var).astype(np.float32)
 
-        if 'wise' in var.name:
-            if 'depth' in var.name:
-                if 'weights' in var.name:
-                    link.dw.W = vals.transpose(3, 2, 0, 1)
-                elif 'beta' in var.name:
-                    link.dw_bn.beta = vals
-                elif 'moving_mean' in var.name:
-                    link.dw_bn.avg_mean = vals
-                elif 'moving_variance' in var.name:
-                    link.dw_bn.avg_var = vals
-            elif 'point' in var.name:
-                if 'weights' in var.name:
-                    link.pw.W = vals.transpose(3, 2, 0, 1)
-                elif 'beta' in var.name:
-                    link.pw_bn.beta = vals
-                elif 'moving_mean' in var.name:
-                    link.pw_bn.avg_mean = vals
-                elif 'moving_variance' in var.name:
-                    link.pw_bn.avg_var = vals
+        if 'depthwise' in var.name:
+            if 'weights' in var.name:
+                assert link.dw.W.shape == vals.transpose(3, 2, 0, 1).shape
+                link.dw.W = vals.transpose(3, 2, 0, 1)
+            elif 'beta' in var.name:
+                assert link.dw_bn.beta.shape == vals.shape
+                link.dw_bn.beta = vals
+            elif 'moving_mean' in var.name:
+                assert link.dw_bn.avg_mean.shape == vals.shape
+                link.dw_bn.avg_mean = vals
+            elif 'moving_variance' in var.name:
+                assert link.dw_bn.avg_var.shape == vals.shape
+                link.dw_bn.avg_var = vals
+
+        elif 'pointwise' in var.name:
+            if 'weights' in var.name:
+                assert link.pw.W.shape == vals.transpose(3, 2, 0, 1).shape
+                link.pw.W = vals.transpose(3, 2, 0, 1)
+            elif 'beta' in var.name:
+                assert link.pw_bn.beta.shape == vals.shape
+                link.pw_bn.beta = vals
+            elif 'moving_mean' in var.name:
+                assert link.pw_bn.avg_mean.shape == vals.shape
+                link.pw_bn.avg_mean = vals
+            elif 'moving_variance' in var.name:
+                assert link.pw_bn.avg_var.shape == vals.shape
+                link.pw_bn.avg_var = vals
+
         elif 'Logit' in var.name:
             if 'weights' in var.name:
+                assert link.conv.W.shape == vals.transpose(3, 2, 0, 1).shape
                 link.conv.W = vals.transpose(3, 2, 0, 1)
             elif 'biases' in var.name:
+                assert link.conv.b.shape == vals.shape
                 link.conv.b = vals
+
         else:
             if 'weights' in var.name:
+                assert link.conv.W.shape == vals.transpose(3, 2, 0, 1).shape
                 link.conv.W = vals.transpose(3, 2, 0, 1)
             elif 'beta' in var.name:
+                assert link.bn.beta.shape == vals.shape
                 link.bn.beta = vals
             elif 'moving_mean' in var.name:
+                assert link.bn.avg_mean.shape == vals.shape
                 link.bn.avg_mean = vals
             elif 'moving_variance' in var.name:
+                assert link.bn.avg_var.shape == vals.shape
                 link.bn.avg_var = vals
 
-img_tf = np.random.randint(0, 256, (1, 224, 224, 3)).astype(np.float32)
-img_tf = img_tf / 255
-img_tf = img_tf - 0.5
-img_tf = img_tf * 2
-img_ch = img_tf.transpose(0, 3, 1, 2)
+### SAVE ROUTINE ###
+if not os.path.exists('chainer-models'):
+    os.makedirs('chainer-models')
+chainer.serializers.save_npz('chainer-models/' + model_name + '.npz', model_ch)
 
-with tf.Session() as sess:
-    saver.restore(sess, 'mobilenet_v1_1.0_224/mobilenet_v1_1.0_224.ckpt')
-    node_tf = tf.get_default_graph().get_tensor_by_name('MobilenetV1/MobilenetV1/Conv2d_0/Relu:0')
-    val_tf = sess.run(node_tf, feed_dict={x:img_tf})
+shutil.rmtree(model_name)
 
-with chainer.using_config('train', True):
-    model_ch.pick = 'conv2d_0'
-    val_ch = model_ch(img_ch).data
-
-val_ch = val_ch.transpose(0, 2, 3, 1)
-print(val_tf.shape, val_ch.shape)
-print(val_tf[0, 0:5, 0:5, 0])
-print(val_ch[0, 0:5, 0:5, 0])
-print()
-print(val_tf[0, -5:, -5:, 0])
-print(val_tf[0, -5:, -5:, 0])
